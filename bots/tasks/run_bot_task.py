@@ -5,7 +5,7 @@ import signal
 from celery import shared_task
 from celery.signals import worker_shutting_down
 
-from bots.bot_controller import BotController
+from bots.bot_controller import SimplifiedBotController
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 @shared_task(bind=True, soft_time_limit=3600)
 def run_bot(self, bot_id):
     logger.info(f"Running bot {bot_id}")
-    bot_controller = BotController(bot_id)
+    bot_controller = SimplifiedBotController(bot_id)
     bot_controller.run()
 
 

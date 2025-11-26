@@ -1,3 +1,3 @@
-from .bot_controller import BotController
+from .simplified_bot_controller import SimplifiedBotController
 
-__all__ = ["BotController"]
+__all__ = ["SimplifiedBotController"]

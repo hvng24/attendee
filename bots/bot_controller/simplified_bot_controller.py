@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ from datetime import timedelta
 
 import gi
 import redis
+import requests
 from django.conf import settings
 from django.utils import timezone
 
@@ -35,18 +37,43 @@ logger = logging.getLogger(__name__)
 
 class AudioForwarder:
     """
-    Placeholder handler that forwards audio chunks to an external service.
-    Currently just logs the audio, but can be extended to send via HTTP/WebSocket.
+    Forwards audio chunks to external AI service via HTTP.
+    Implements connection pooling and error handling for reliable delivery.
     """
 
-    def __init__(self, service_url=None):
+    def __init__(self, service_url=None, bot_id=None, meeting_id=None):
         self.service_url = service_url
+        self.bot_id = bot_id
+        self.meeting_id = meeting_id
         self.chunk_count = 0
         self.total_bytes = 0
+        self.failed_requests = 0
+
+        # Create a requests session for connection pooling
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+
+        # Configure retry behavior
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=requests.adapters.Retry(
+                total=3,
+                backoff_factor=0.3,
+                status_forcelist=[500, 502, 503, 504],
+            ),
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+        if self.service_url:
+            logger.info(f"AudioForwarder initialized with service_url: {self.service_url}")
+        else:
+            logger.warning("AudioForwarder initialized without service_url - audio will only be logged")
 
     def forward_audio_chunk(self, speaker_id, chunk_time, chunk_bytes, sample_rate):
         """
-        Forward audio chunk to external service.
+        Forward audio chunk to external AI service.
 
         Args:
             speaker_id: Unique identifier for the speaker
@@ -57,45 +84,81 @@ class AudioForwarder:
         self.chunk_count += 1
         self.total_bytes += len(chunk_bytes)
 
-        # Placeholder: Just log the audio chunk info
+        # Log periodic stats
         if self.chunk_count % 100 == 0:
             logger.info(
                 f"Audio forwarded - Speaker: {speaker_id}, "
                 f"Chunks: {self.chunk_count}, "
                 f"Total bytes: {self.total_bytes}, "
-                f"Sample rate: {sample_rate}"
+                f"Sample rate: {sample_rate}, "
+                f"Failed: {self.failed_requests}"
             )
 
-        # TODO: Implement actual forwarding to external service
-        # Example implementations:
-        #
-        # 1. WebSocket:
-        # if self.ws_client:
-        #     payload = {
-        #         "speaker_id": speaker_id,
-        #         "timestamp": chunk_time.isoformat(),
-        #         "audio_data": base64.b64encode(chunk_bytes).decode(),
-        #         "sample_rate": sample_rate,
-        #     }
-        #     self.ws_client.send(json.dumps(payload))
-        #
-        # 2. HTTP POST:
-        # requests.post(
-        #     f"{self.service_url}/audio",
-        #     json={
-        #         "speaker_id": speaker_id,
-        #         "timestamp": chunk_time.isoformat(),
-        #         "audio_data": base64.b64encode(chunk_bytes).decode(),
-        #         "sample_rate": sample_rate,
-        #     }
-        # )
+        # If no service URL configured, just log
+        if not self.service_url:
+            return
+
+        try:
+            # Encode audio data to base64
+            audio_data_b64 = base64.b64encode(chunk_bytes).decode()
+
+            # Prepare payload
+            payload = {
+                "bot_id": self.bot_id,
+                "meeting_id": self.meeting_id,
+                "speaker_id": speaker_id,
+                "timestamp": chunk_time.isoformat(),
+                "audio_data": audio_data_b64,
+                "sample_rate": sample_rate,
+                "duration_ms": None,  # Could calculate from chunk size
+            }
+
+            # Send to AI service
+            response = self.session.post(
+                f"{self.service_url}/audio/ingest",
+                json=payload,
+                timeout=5.0,  # 5 second timeout
+            )
+
+            response.raise_for_status()
+
+            # Log success on first chunk and occasionally
+            if self.chunk_count == 1 or self.chunk_count % 500 == 0:
+                logger.info(
+                    f"Successfully forwarded audio chunk {self.chunk_count} "
+                    f"to AI service: {response.json()}"
+                )
+
+        except requests.exceptions.Timeout:
+            self.failed_requests += 1
+            logger.warning(
+                f"Timeout forwarding audio chunk {self.chunk_count} "
+                f"(speaker: {speaker_id})"
+            )
+        except requests.exceptions.RequestException as e:
+            self.failed_requests += 1
+            logger.error(
+                f"Error forwarding audio chunk {self.chunk_count} "
+                f"(speaker: {speaker_id}): {e}"
+            )
+        except Exception as e:
+            self.failed_requests += 1
+            logger.error(
+                f"Unexpected error forwarding audio chunk {self.chunk_count}: {e}",
+                exc_info=True
+            )
 
     def cleanup(self):
         """Cleanup resources when bot shuts down."""
         logger.info(
             f"AudioForwarder cleanup - Total chunks: {self.chunk_count}, "
-            f"Total bytes: {self.total_bytes}"
+            f"Total bytes: {self.total_bytes}, "
+            f"Failed requests: {self.failed_requests}"
         )
+
+        # Close the requests session
+        if self.session:
+            self.session.close()
 
 
 class SimplifiedBotController:
@@ -124,7 +187,12 @@ class SimplifiedBotController:
 
         # Audio forwarding service
         audio_service_url = self.bot_in_db.settings.get("audio_service_url")
-        self.audio_forwarder = AudioForwarder(service_url=audio_service_url)
+        meeting_id = self.bot_in_db.settings.get("meeting_id")  # Get meeting_id from settings if available
+        self.audio_forwarder = AudioForwarder(
+            service_url=audio_service_url,
+            bot_id=self.bot_in_db.object_id,
+            meeting_id=meeting_id,
+        )
 
         # Bot adapter (will be initialized in run())
         self.adapter = None
